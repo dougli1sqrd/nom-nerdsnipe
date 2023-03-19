@@ -1,8 +1,10 @@
 use std::fmt::Debug;
 use std::ops::Deref;
+use std::vec;
 
 use nom;
 use nom::bytes::streaming::tag;
+use nom::error::Error;
 use nom::{character, IResult};
 
 fn main() {
@@ -19,7 +21,7 @@ fn main() {
             vec![Extension(String::from("I"))]
         }
     }
-    println!("{:?}", parse_one("I", Box::new(I)));
+    println!("{:?}", parse_one("I", &I));
 
     #[derive(Debug)]
     struct X(String);
@@ -33,7 +35,7 @@ fn main() {
         }
     }
 
-    println!("{:?}", parse_one("Xabcd", Box::new(X(Default::default()))));
+    println!("{:?}", parse_one("Xabcd", &X(Default::default())));
 
     #[derive(Debug)]
     struct G;
@@ -46,7 +48,34 @@ fn main() {
         }
     }
     
-    println!("{:?}", parse_one("G", Box::new(G)));
+    println!("{:?}", parse_one("G", &G));
+
+    println!("{:?}", parse_one_from_many("IXfoo", &[&I, &X(Default::default())]));
+    println!("{:?}", parse_one_from_many("blah", &[&I, &X(Default::default())]));
+
+    struct A;
+    impl IntoExtensionShape for A {
+        fn into_shape(&self) -> ExtensionShape {
+            ExtensionShape::Tag(String::from("A"))
+        }
+
+        fn generate(&self) -> Vec<Extension> {
+            vec![Extension(String::from("A"))]
+        }
+    }
+
+    struct C;
+    impl IntoExtensionShape for C {
+        fn into_shape(&self) -> ExtensionShape {
+            ExtensionShape::Tag(String::from("C"))
+        }
+
+        fn generate(&self) -> Vec<Extension> {
+            vec![Extension(String::from("C"))]
+        }
+    }
+    println!("{:?}", parse("IACXabc", &[&I, &A, &C, &X(Default::default())]))
+
 }
 
 #[derive(Debug)]
@@ -75,7 +104,7 @@ pub trait IntoExtensionShape {
 #[derive(Debug)]
 pub struct Extension(String);
 
-pub fn parse_one(input: &str, ext: Box<dyn IntoExtensionShape>) -> IResult<&str, Vec<Extension>> {
+pub fn parse_one<'a>(input: &'a str, ext: &dyn IntoExtensionShape) -> IResult<&'a str, Vec<Extension>> {
     let shape = ext.into_shape();
     match shape {
         ExtensionShape::Tag(_) => {
@@ -94,9 +123,46 @@ pub fn parse_one(input: &str, ext: Box<dyn IntoExtensionShape>) -> IResult<&str,
     }
 }
 
-pub fn parse(input: &str, extensions: Vec<Box<dyn IntoExtensionShape>>) -> IResult<&str, Vec<Extension>> {
-    for ext in extensions {
-        let parsed = parse_one(input, ext);
+pub fn parse_one_from_many<'a>(input: &'a str, extensions: &[&dyn IntoExtensionShape]) -> IResult<&'a str, (Vec<Extension>, usize)> {
+    let mut inp = input;
+    for (pos, ext) in extensions.into_iter().enumerate() {
+        match parse_one(inp, *ext) {
+            Ok((rest, v)) => {
+                return Ok((rest, (v, pos)));
+            },
+            Err(nom::Err::Error(c)) => {
+                inp = c.input;
+                continue;
+            },
+            Err(x) => {
+                return Err(x);
+            }
+        }
     }
-    Ok(("", vec![]))
+    // Could not parse any of the input
+    Err(nom::Err::Failure(Error { input: inp, code: nom::error::ErrorKind::Fail }))
+}
+
+pub fn parse<'a>(input: &'a str, extensions: &[&dyn IntoExtensionShape]) -> IResult<&'a str, Vec<Extension>> {
+    
+    fn accum_parse<'a>(input: &'a str, extensions: &[&dyn IntoExtensionShape], mut accum: Vec<Extension>) -> IResult<&'a str, Vec<Extension>> {
+        // If we have input left to parse but we ran out of extensions then we failed
+        if input.len() > 0 && extensions.is_empty() {
+            return Err(nom::Err::Failure(Error { input, code: nom::error::ErrorKind::Complete }));
+        }
+        if input.is_empty() {
+            return Ok(("", accum))
+        }
+        match parse_one_from_many(input, extensions) {
+            Ok((rest, (mut found, pos))) => {
+                accum.append(&mut found);
+                accum_parse(rest, &extensions[pos + 1..], accum)
+            },
+            Err(e) => {
+                Err(e)
+            }
+        }
+    }
+
+    accum_parse(input, extensions, vec![])
 }
